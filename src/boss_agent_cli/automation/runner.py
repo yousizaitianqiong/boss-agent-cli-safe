@@ -33,9 +33,18 @@ def run_automation_cycle(
 	guard = SafetyGuard(config, state, dry_run=dry_run)
 	events: list[AutomationEvent] = []
 	if config.mode is AutomationMode.PAUSED:
+		event = make_event(
+			platform,
+			"",
+			PlatformAction.SKIP,
+			EventStatus.STOPPED_BY_SAFETY,
+			0.0,
+			"自动化默认已暂停；未扫描会话、未发送消息、未执行任何招聘者动作",
+		)
+		store.append_event(event)
 		return RunReport(
 			status="PAUSED",
-			events=(),
+			events=(event,),
 			dry_run=dry_run,
 			platform=platform,
 			mode=config.mode,

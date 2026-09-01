@@ -100,6 +100,36 @@ def test_login_via_cdp_stops_playwright_when_user_agent_extraction_fails(mock_sl
 
 @patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
 @patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_safe_cdp_login_notifies_ready_and_keeps_dedicated_edge_page(mock_sleep, mock_probe_cdp):
+	mock_context = MagicMock()
+	mock_context.cookies.side_effect = [
+		[{"name": "wt2", "value": "token", "domain": ".zhipin.com"}],
+		[{"name": "wt2", "value": "token", "domain": ".zhipin.com"}],
+	]
+	mock_launcher, mock_playwright, mock_page = _mock_cdp_playwright(mock_context)
+	ready = MagicMock()
+	authenticated = MagicMock()
+
+	with patch("boss_agent_cli.auth.browser.sync_playwright", return_value=mock_launcher):
+		result = login_via_cdp(
+			timeout=1,
+			ready_callback=ready,
+			authenticated_callback=authenticated,
+			user_agent_override="Edge-CDP-UA",
+			keep_page=True,
+		)
+
+	assert result["cookies"]["wt2"] == "token"
+	assert result["user_agent"] == "Edge-CDP-UA"
+	ready.assert_called_once_with()
+	authenticated.assert_called_once_with()
+	mock_page.evaluate.assert_not_called()
+	mock_page.close.assert_not_called()
+	mock_playwright.stop.assert_called_once()
+
+
+@patch("boss_agent_cli.auth.browser.probe_cdp", return_value="ws://localhost/devtools/browser")
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
 def test_zhilian_login_via_cdp_reuses_recruiter_page(mock_sleep, mock_probe_cdp):
 	mock_page = MagicMock()
 	mock_page.url = "https://rd6.zhaopin.com/app/im?sessionId=abc"
@@ -152,6 +182,58 @@ def test_login_via_browser_tolerates_networkidle_timeout(mock_sleep, mock_extrac
 	mock_page.wait_for_load_state.assert_called_once_with("networkidle", timeout=_NETWORKIDLE_GRACE_MS)
 	mock_extract_stoken.assert_called_once_with(mock_page)
 	mock_browser.close.assert_called_once()
+
+
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_safe_login_reads_stoken_from_context_without_page_evaluate(mock_sleep):
+	mock_page = MagicMock()
+	mock_context = MagicMock()
+	mock_context.new_page.return_value = mock_page
+	mock_context.cookies.side_effect = [
+		[{"name": "wt2", "value": "token", "domain": ".zhipin.com"}],
+		[
+			{"name": "wt2", "value": "token", "domain": ".zhipin.com"},
+			{"name": "__zp_stoken__", "value": "safe-stoken", "domain": ".zhipin.com"},
+		],
+	]
+	mock_browser = MagicMock()
+	mock_browser.version = "151.0.7922.34"
+	mock_browser.new_context.return_value = mock_context
+
+	with (
+		patch.dict("os.environ", {"BOSS_SAFE_ISOLATED_BROWSER": "1"}),
+		patch("boss_agent_cli.auth.browser.sync_playwright", return_value=_mock_playwright_context(mock_browser)),
+	):
+		result = login_via_browser(timeout=2, platform="zhipin")
+
+	assert result["stoken"] == "safe-stoken"
+	assert "Chrome/151.0.7922.34" in result["user_agent"]
+	mock_page.evaluate.assert_not_called()
+	assert "user_agent" in mock_browser.new_context.call_args.kwargs
+
+
+@patch("boss_agent_cli.auth.browser.time.sleep", return_value=None)
+def test_safe_login_allows_missing_optional_stoken(mock_sleep):
+	mock_page = MagicMock()
+	mock_context = MagicMock()
+	mock_context.new_page.return_value = mock_page
+	mock_context.cookies.side_effect = [
+		[{"name": "wt2", "value": "token", "domain": ".zhipin.com"}],
+		[{"name": "wt2", "value": "token", "domain": ".zhipin.com"}],
+	]
+	mock_browser = MagicMock()
+	mock_browser.version = "151.0.7922.34"
+	mock_browser.new_context.return_value = mock_context
+
+	with (
+		patch.dict("os.environ", {"BOSS_SAFE_ISOLATED_BROWSER": "1"}),
+		patch("boss_agent_cli.auth.browser.sync_playwright", return_value=_mock_playwright_context(mock_browser)),
+	):
+		result = login_via_browser(timeout=2, platform="zhipin")
+
+	assert result["cookies"]["wt2"] == "token"
+	assert result["stoken"] == ""
+	mock_page.evaluate.assert_not_called()
 
 
 @patch("boss_agent_cli.auth.browser._extract_stoken", return_value="fresh-stoken")

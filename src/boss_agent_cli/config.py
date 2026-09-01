@@ -13,16 +13,9 @@ DEFAULTS: dict[str, Any] = {
 	"operating_mode": "assisted",
 	"low_risk_mode": True,
 	"automation": {
-		"mode": "autonomous",
+		"mode": "paused",
 		"platforms": ["zhilian", "zhipin"],
-		"allowed_actions": [
-			"scan_conversations",
-			"read_candidate_profile",
-			"send_questionnaire",
-			"send_follow_up",
-			"exchange_contact",
-			"create_interview_lead",
-		],
+		"allowed_actions": [],
 		"human_review_threshold": 0.65,
 		"auto_execute_threshold": 0.82,
 	},

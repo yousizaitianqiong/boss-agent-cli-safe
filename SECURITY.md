@@ -1,41 +1,41 @@
-# Security Policy
+# 安全策略
 
-## Supported Versions
+## 支持版本
 
-只有最新的 minor 版本会收到安全修复。项目发布频繁（见 [CHANGELOG.md](CHANGELOG.md)），
-不维护历史分支——修复以新版本形式发出，请升级到最新版而不是期待补丁回移。
+安全派生版只维护最新 Release，不承诺向旧标签回移修复。
 
-| Version | Supported          |
-|---------|--------------------|
-| 1.17.x  | :white_check_mark: |
-| < 1.17  | :x:                |
+| 版本 | 状态 |
+|---|---|
+| `v1.18.0-safe.x` | 支持 |
+| 更早版本 | 不支持 |
 
-升级：`uv tool install --upgrade boss-agent-cli`（或 `pip install -U boss-agent-cli`）。
+安全版不发布到 PyPI。请从 [GitHub Releases](https://github.com/yousizaitianqiong/boss-agent-cli-safe/releases) 下载最新版，并使用同一 Release 中的 `SHA256SUMS.txt` 校验产物。
 
-## Reporting a Vulnerability
+## 私下报告漏洞
 
-如果你发现了安全漏洞，请**不要**在公开 Issue 中提交。
+请不要在公开 Issue、讨论或日志中粘贴 Cookie、Token、`security_id`、个人配置、简历、数据库或浏览器 profile。
 
-请通过以下方式私下报告：
+请通过 [GitHub Security Advisories](https://github.com/yousizaitianqiong/boss-agent-cli-safe/security/advisories/new) 提交私密报告，并包含：
 
-1. 发送邮件至 can4hou6joeng4@163.com
-2. 或使用 [GitHub Security Advisories](https://github.com/can4hou6joeng4/boss-agent-cli/security/advisories/new) 创建私密报告
+- 漏洞描述与影响范围；
+- 最小化、已脱敏的复现步骤；
+- 受影响版本与操作系统；
+- 可行时附上修复建议。
 
-请在报告中包含：
-- 漏洞的详细描述
-- 复现步骤
-- 影响范围评估
-- 如果可能，提供修复建议
+如果问题来自未修改的上游功能，也可同时参考[上游安全策略](https://github.com/can4hou6joeng4/boss-agent-cli/security/policy)，但不要向任何公开渠道发送凭据。
 
-我们会在 **48 小时内**确认收到报告，并在 **7 天内**给出初步评估。
+平台 Cookie、CDP、真实账号测试和研究边界详见[平台风险说明](docs/platform-risk.md)。
 
-## Security Considerations
+## 安全边界
 
-本项目默认启用低风险辅助模式：本地辅助、只读优先、用户主动触发、不批量触达、不抓取平台数据。开发时请特别注意：
+`boss-safe` 的核心边界包括：
 
-- **Cookie/Token 存储**：使用 Fernet 对称加密 + PBKDF2 机器绑定密钥
-- **浏览器兼容通道**：仅用于用户主动登录和低风险兼容路径，所有浏览器操作限定在 `zhipin.com` 域名
-- **本地数据**：缓存数据存储在 `~/.boss-agent/`，不上传任何数据到第三方服务
-- **CSV/HTML 导出**：已实施公式注入防护和 XSS 防护
+- 版本化的真实申请人画像与技能证据；
+- 可见、独立 profile、loopback-only CDP 的专用浏览器；
+- PID 创建时间、可执行文件、命令行、进程树和端口归属校验；
+- 只读探针、一次性预览授权和批次专属交互确认；
+- 北京时间每日写请求硬额度、永久岗位去重和写前额度保留；
+- 超时记 `unknown`、不自动重试、风险异常立即停止；
+- 机器绑定加密的认证与临时安全标识，审计不保存原始凭据。
 
-更多平台边界、Cookie/CDP、真实账号和 smoke test 风险边界见 [docs/platform-risk.md](docs/platform-risk.md)。
+这些机制不能保证平台账号安全，也不能替代法律、平台规则或人工判断。上游 `boss` 和 `boss-mcp` 入口为兼容性而保留，不自动继承 `boss-safe` 的全部限制。

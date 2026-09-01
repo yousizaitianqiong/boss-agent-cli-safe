@@ -44,3 +44,17 @@ docs/blog/linuxdo-promo.md
 
 # baoyu-design working dir (canonical promo source lives in demo/promo-showcase/)
 designs/
+
+# boss-agent-cli-safe 本机状态、凭据与个人运行记录（绝不进入公开仓库）
+/TODO.md
+/INCIDENT.md
+/PRD.md
+/.boss-agent-safe/
+/boss-agent-safe-data/
+/safe-config.json
+/safe_apply.db
+/safe_apply.db-*
+/edge-cdp-profile/
+/.env
+/.env.*
+!/.env.example

@@ -2,7 +2,8 @@ import logging
 import os
 import sys
 import time
-from typing import Any, cast
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence, cast
 from urllib.parse import urlparse
 
 from patchright.sync_api import sync_playwright
@@ -41,6 +42,27 @@ def _get_platform_config(platform: str) -> dict[str, str]:
 	if config is None:
 		raise ValueError(f"unsupported platform: {platform}")
 	return config
+
+
+def _safe_isolated_mode() -> bool:
+	return os.environ.get("BOSS_SAFE_ISOLATED_BROWSER", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _chromium_user_agent(browser: Any) -> str:
+	version = str(getattr(browser, "version", "") or "").strip()
+	if not version:
+		version = "120.0.0.0"
+	return (
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+		f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
+	)
+
+
+def _cookie_value(cookies_list: Sequence[Mapping[str, Any]], name: str) -> str:
+	for cookie in cookies_list:
+		if cookie.get("name") == name:
+			return str(cookie.get("value") or "")
+	return ""
 
 
 def _extract_zhilian_client_id(page: Any) -> str:
@@ -117,7 +139,16 @@ def probe_cdp(cdp_url: str | None = None) -> str | None:
 		return None
 
 
-def login_via_cdp(*, cdp_url: str | None = None, timeout: int = 120, platform: str = "zhipin") -> dict[str, Any]:
+def login_via_cdp(
+	*,
+	cdp_url: str | None = None,
+	timeout: int = 120,
+	platform: str = "zhipin",
+	ready_callback: Callable[[], None] | None = None,
+	authenticated_callback: Callable[[], None] | None = None,
+	user_agent_override: str | None = None,
+	keep_page: bool = False,
+) -> dict[str, Any]:
 	"""
 	通过 CDP 连接用户 Chrome 扫码登录。
 	返回 token dict，失败抛异常。
@@ -131,7 +162,7 @@ def login_via_cdp(*, cdp_url: str | None = None, timeout: int = 120, platform: s
 	if not ws_url:
 		raise ConnectionError("CDP 不可用，请先运行 boss-chrome 启动带调试端口的 Chrome")
 
-	print("[boss] 正在 CDP Chrome 中打开登录页...", file=sys.stderr)
+	print("[boss] 正在专用 CDP 浏览器中打开登录页...", file=sys.stderr)
 	pw = sync_playwright().start()
 	browser = pw.chromium.connect_over_cdp(ws_url)
 	ctx = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -150,8 +181,10 @@ def login_via_cdp(*, cdp_url: str | None = None, timeout: int = 120, platform: s
 				)
 			except Exception:
 				pass
+		if ready_callback is not None:
+			ready_callback()
 
-		print(f"[boss] 请在 Chrome 中扫码登录，等待中...（超时 {timeout}s）", file=sys.stderr)
+		print(f"[boss] 请在专用 Edge 中扫码或确认登录，等待中...（超时 {timeout}s）", file=sys.stderr)
 
 		for i in range(timeout):
 			time.sleep(1)
@@ -159,6 +192,8 @@ def login_via_cdp(*, cdp_url: str | None = None, timeout: int = 120, platform: s
 			success = [c for c in cookies if c["name"] == success_cookie and cookie_domain in c.get("domain", "")]
 			if success:
 				print("[boss] 检测到登录成功！", file=sys.stderr)
+				if authenticated_callback is not None:
+					authenticated_callback()
 				break
 			if i > 0 and i % 15 == 0:
 				print(f"[boss] 等待中... {i}s", file=sys.stderr)
@@ -171,7 +206,11 @@ def login_via_cdp(*, cdp_url: str | None = None, timeout: int = 120, platform: s
 			except Exception:
 				pass
 		all_cookies = {c["name"]: c["value"] for c in ctx.cookies() if cookie_domain in c.get("domain", "")}
-		ua = page.evaluate("navigator.userAgent")
+		# 安全入口从本机严格 CDP 元数据传入真实 Edge UA，绝不在登录成功后
+		# 再执行可能永久阻塞的同步 page.evaluate。普通 CLI 保持原行为。
+		ua = user_agent_override or (
+			_chromium_user_agent(browser) if _safe_isolated_mode() else page.evaluate("navigator.userAgent")
+		)
 		x_zp_client_id = _zhilian_client_id_from(all_cookies, page) if platform == "zhilian" else ""
 
 		result: dict[str, Any] = {"cookies": all_cookies, "stoken": "", "user_agent": ua}
@@ -180,13 +219,19 @@ def login_via_cdp(*, cdp_url: str | None = None, timeout: int = 120, platform: s
 		return result
 	finally:
 		try:
-			if created_page:
+			if created_page and not keep_page:
 				page.close()
 		finally:
 			pw.stop()
 
 
-def login_via_browser(*, timeout: int = 120, platform: str = "zhipin") -> dict[str, Any]:
+def login_via_browser(
+	*,
+	timeout: int = 120,
+	platform: str = "zhipin",
+	user_data_dir: Path | None = None,
+	ready_callback: Callable[[], None] | None = None,
+) -> dict[str, Any]:
 	"""
 	使用 patchright（Playwright 兼容 fork）打开登录页。
 	双重检测登录成功：监听 API 响应 + 轮询 wt2 cookie。
@@ -197,17 +242,39 @@ def login_via_browser(*, timeout: int = 120, platform: str = "zhipin") -> dict[s
 	cookie_domain = config["cookie_domain"]
 	success_cookie = config["success_cookie"]
 	with sync_playwright() as p:
-		browser = p.chromium.launch(headless=False)
-		context = browser.new_context(
-			viewport={"width": 1280, "height": 800},
-			locale="zh-CN",
-			timezone_id="Asia/Shanghai",
-		)
+		isolated = _safe_isolated_mode()
+		context_options: dict[str, Any] = {
+			"viewport": {"width": 1280, "height": 800},
+			"locale": "zh-CN",
+			"timezone_id": "Asia/Shanghai",
+		}
+		persistent = user_data_dir is not None
+		if user_data_dir is not None:
+			user_data_dir.mkdir(parents=True, exist_ok=True)
+			context = p.chromium.launch_persistent_context(
+				str(user_data_dir), headless=False, **context_options
+			)
+			browser = context.browser
+			fixed_user_agent = _chromium_user_agent(browser) if isolated else ""
+		else:
+			browser = p.chromium.launch(headless=False)
+			fixed_user_agent = _chromium_user_agent(browser) if isolated else ""
+			if fixed_user_agent:
+				context_options["user_agent"] = fixed_user_agent
+			context = browser.new_context(**context_options)
 		page = context.new_page()
+
+		def close_login_context() -> None:
+			if persistent:
+				context.close()
+			elif browser is not None:
+				browser.close()
 
 		page.goto(login_page_url, wait_until="domcontentloaded")
 		print("已打开 BOSS 直聘登录页。", file=sys.stderr)
 		print(f"请扫码或手机号登录（超时 {timeout} 秒）...", file=sys.stderr)
+		if ready_callback is not None:
+			ready_callback()
 
 		# 双重检测：API 响应 或 wt2 cookie 出现，任一触发即认为登录成功
 		login_detected = False
@@ -237,7 +304,7 @@ def login_via_browser(*, timeout: int = 120, platform: str = "zhipin") -> dict[s
 			time.sleep(1)
 
 		if not login_detected:
-			browser.close()
+			close_login_context()
 			raise TimeoutError(f"扫码登录超时（{timeout}秒）")
 
 		print("检测到登录成功，正在提取凭证...", file=sys.stderr)
@@ -248,11 +315,17 @@ def login_via_browser(*, timeout: int = 120, platform: str = "zhipin") -> dict[s
 
 		cookies_list = context.cookies()
 		cookies = {c["name"]: c["value"] for c in cookies_list if cookie_domain in c.get("domain", "")}
-		user_agent = page.evaluate("navigator.userAgent")
-		stoken = _extract_stoken(page) if platform == "zhipin" else ""
+		if isolated:
+			user_agent = fixed_user_agent
+			stoken = _cookie_value(cookies_list, "__zp_stoken__") if platform == "zhipin" else ""
+			if platform == "zhipin" and not stoken:
+				print("提示：登录 Cookie 已生成，但当前页面未暴露 __zp_stoken__；浏览器搜索通道仍可验证。", file=sys.stderr)
+		else:
+			user_agent = page.evaluate("navigator.userAgent")
+			stoken = _extract_stoken(page) if platform == "zhipin" else ""
 		x_zp_client_id = _extract_zhilian_client_id(page) if platform == "zhilian" else ""
 
-		browser.close()
+		close_login_context()
 
 	result: dict[str, Any] = {
 		"cookies": cookies,
@@ -300,7 +373,13 @@ def refresh_stoken(cookies: dict[str, Any], user_agent: str) -> str:
 		)
 		page = context.new_page()
 		_warm_home_for_runtime(page, HOME_URL, stage="刷新 stoken")
-		stoken = _extract_stoken(page)
+		if _safe_isolated_mode():
+			stoken = _cookie_value(context.cookies(), "__zp_stoken__")
+			if not stoken:
+				browser.close()
+				raise RuntimeError("独立浏览器未生成 __zp_stoken__，需要重新登录")
+		else:
+			stoken = _extract_stoken(page)
 		browser.close()
 
 	return stoken

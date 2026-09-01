@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v*-safe.*"
 
 permissions:
   contents: write
@@ -31,6 +31,12 @@ jobs:
       - name: Build package
         run: uv build
 
+      - name: Scan tracked tree and artifacts
+        run: uv run python scripts/scan_release_artifacts.py --git-tree --artifacts dist
+
+      - name: Create SHA256 checksums
+        run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -41,9 +47,4 @@ jobs:
           files: |
             dist/*.whl
             dist/*.tar.gz
-
-      - name: Publish to PyPI
-        if: ${{ !contains(github.ref, 'rc') && !contains(github.ref, 'beta') }}
-        run: uv publish
-        env:
-          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+            dist/SHA256SUMS.txt

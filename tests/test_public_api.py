@@ -165,13 +165,12 @@ def test_list_platforms_contains_zhipin(boss_agent_cli):
 # ── 版本格式 ──────────────────────────────────────────────
 
 
-def test_version_is_semver_string(boss_agent_cli):
+def test_version_is_pep440_release_or_post_release(boss_agent_cli):
+	import re
+
 	version = boss_agent_cli.__version__
 	assert isinstance(version, str)
-	parts = version.split(".")
-	assert len(parts) == 3, f"版本应为 X.Y.Z 格式，实际为 {version}"
-	for part in parts:
-		assert part.isdigit(), f"版本各段应为数字，实际为 {part}"
+	assert re.fullmatch(r"\d+\.\d+\.\d+(?:\.post\d+)?", version), f"版本应为 PEP 440 发布版本，实际为 {version}"
 
 
 def test_package_version_matches_pyproject_and_cli(boss_agent_cli):

@@ -94,6 +94,17 @@ class TokenStore:
 		encrypted = fernet.encrypt(plaintext)
 		self._session_path.write_bytes(encrypted)
 
+	def _encrypt_text(self, value: str) -> str:
+		"""使用与本地登录态相同的机器绑定密钥加密短文本。"""
+		return Fernet(self._derive_key()).encrypt(value.encode("utf-8")).decode("ascii")
+
+	def _decrypt_text(self, value: str) -> str | None:
+		"""解密安全投递中的临时标识；密文失效时返回 None。"""
+		try:
+			return Fernet(self._derive_key()).decrypt(value.encode("ascii")).decode("utf-8")
+		except (InvalidToken, UnicodeDecodeError, ValueError):
+			return None
+
 	def load(self) -> dict[str, Any] | None:
 		if not self._session_path.exists():
 			return None

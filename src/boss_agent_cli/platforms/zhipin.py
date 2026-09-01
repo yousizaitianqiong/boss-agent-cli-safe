@@ -20,8 +20,24 @@ if TYPE_CHECKING:
 _ERROR_CODE_MAP: dict[int, str] = {
 	9: "RATE_LIMITED",
 	36: "ACCOUNT_RISK",
-	37: "TOKEN_REFRESH_FAILED",
 }
+
+
+def _is_explicit_token_expiry(message: str) -> bool:
+	normalized = "".join(message.lower().split())
+	return any(
+		term in normalized
+		for term in (
+			"tokenexpired",
+			"stokenexpired",
+			"token过期",
+			"stoken过期",
+			"token已过期",
+			"stoken已过期",
+			"令牌过期",
+			"令牌已过期",
+		)
+	)
 
 
 class BossPlatform(Platform):
@@ -45,6 +61,13 @@ class BossPlatform(Platform):
 		return response.get("zpData")
 
 	def parse_error(self, response: dict[str, Any]) -> tuple[str, str]:
+		if response.get("code") == 37:
+			message = str(response.get("message") or response.get("msg") or response.get("error") or "")
+			return ("TOKEN_REFRESH_FAILED" if _is_explicit_token_expiry(message) else "ENVIRONMENT_RISK", message)
+		if response.get("code") == -1:
+			message = str(response.get("message") or response.get("msg") or response.get("error") or "")
+			if "BROWSER_FETCH_TIMEOUT" in message or "BROWSER_HUNG" in message:
+				return "BROWSER_HUNG", message
 		return self._classify_platform_error(response, _ERROR_CODE_MAP)
 
 	# ── P0 只读委托 ─────────────────────────────────────

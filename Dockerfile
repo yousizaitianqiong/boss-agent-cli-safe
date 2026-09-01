@@ -31,9 +31,9 @@ RUN uv sync --frozen --no-dev --no-editable --extra mcp
 
 FROM python:${PYTHON_VERSION}-slim AS runtime
 
-LABEL org.opencontainers.image.title="boss-agent-cli" \
-	org.opencontainers.image.description="MCP server and read-only CLI surface for boss-agent-cli" \
-	org.opencontainers.image.source="https://github.com/can4hou6joeng4/boss-agent-cli" \
+LABEL org.opencontainers.image.title="boss-agent-cli-safe" \
+	org.opencontainers.image.description="Safe derivative with the upstream CLI and MCP compatibility entrypoints" \
+	org.opencontainers.image.source="https://github.com/yousizaitianqiong/boss-agent-cli-safe" \
 	org.opencontainers.image.licenses="MIT"
 
 ENV PATH="/app/.venv/bin:$PATH" \

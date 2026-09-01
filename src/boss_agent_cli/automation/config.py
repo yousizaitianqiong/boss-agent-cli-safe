@@ -58,15 +58,18 @@ def automation_config_from_dict(raw: dict[str, Any] | None) -> AutomationConfig:
 	data = raw or {}
 	default_actions = [action.value for action in DEFAULT_ALLOWED_ACTIONS]
 	allowed_action_values = {action.value for action in PlatformAction}
+	raw_actions = data.get("allowed_actions")
+	if raw_actions is None:
+		raw_actions = default_actions
 	actions = tuple(
 		PlatformAction(item)
-		for item in data.get("allowed_actions", default_actions)
+		for item in raw_actions
 		if item in allowed_action_values
 	)
 	return AutomationConfig(
 		mode=AutomationMode(data.get("mode", _DEFAULT.mode.value)),
 		platforms=tuple(str(item) for item in data.get("platforms", _DEFAULT.platforms)),
-		allowed_actions=actions or DEFAULT_ALLOWED_ACTIONS,
+		allowed_actions=actions,
 		human_review_threshold=float(data.get("human_review_threshold", _DEFAULT.human_review_threshold)),
 		auto_execute_threshold=float(data.get("auto_execute_threshold", _DEFAULT.auto_execute_threshold)),
 		max_actions_per_run=int(data.get("max_actions_per_run", _DEFAULT.max_actions_per_run)),

@@ -10,6 +10,7 @@ Supports two modes:
   2. Patchright mode (fallback): launches a headless Chromium instance
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ from types import TracebackType
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from patchright.sync_api import TimeoutError as PatchrightTimeoutError
 from patchright.sync_api import sync_playwright
 
 from boss_agent_cli.api import endpoints
@@ -25,6 +27,9 @@ from boss_agent_cli.auth.browser import _DEFAULT_CDP_URL as CDP_DEFAULT_URL
 
 HOME_URL = "https://www.zhipin.com/"
 _ZHIPIN_HOST = "zhipin.com"
+_SAFE_STRICT_CDP_ENV = "BOSS_SAFE_STRICT_CDP_URL"
+_SECURITY_URL_MARKERS = ("security-check", "captcha", "verify", "validate")
+_ACCOUNT_RISK_URL_MARKERS = ("account-risk", "account_risk", "account/abnormal")
 
 
 def _is_zhipin_url(url: str) -> bool:
@@ -49,6 +54,16 @@ def _find_reusable_zhipin_page(context: Any) -> Any | None:
 	return None
 
 
+def _page_challenge_code(url: str) -> str | None:
+	"""仅按 URL 的稳定标识识别人工安全检查，不读取页面正文。"""
+	lower = url.lower()
+	if any(marker in lower for marker in _ACCOUNT_RISK_URL_MARKERS):
+		return "ACCOUNT_RISK"
+	if any(marker in lower for marker in _SECURITY_URL_MARKERS):
+		return "CAPTCHA"
+	return None
+
+
 class RecruiterChatTabRequired(RuntimeError):
 	"""招聘者操作（issue #217 修复路径）需要用户已打开 chat/index 页。
 
@@ -64,10 +79,30 @@ class RecruiterChatTabRequired(RuntimeError):
 		)
 
 
+class BrowserStageError(RuntimeError):
+	"""带固定诊断阶段的浏览器错误，不携带页面或响应内容。"""
+
+	def __init__(self, code: str, stage: str) -> None:
+		self.code = code
+		self.stage = stage
+		super().__init__(code)
+
+
+class BrowserPageNotReady(BrowserStageError):
+	"""页面未完成 commit 或不在 BOSS 同源上，禁止页面内请求。"""
+
+	code = "BROWSER_PAGE_NOT_READY"
+
+	def __init__(self, stage: str = "request_page_ready") -> None:
+		super().__init__(self.code, stage)
+
+
 # 超时常量
 _CDP_PROBE_TIMEOUT = 3  # 显式 --cdp-url 的 CDP 探测 HTTP 超时（秒）
 _CDP_AUTO_PROBE_TIMEOUT = 1  # 默认自动探测 localhost:9222 的超时（无调试端口时快速失败，省 ~2s）
 _NAV_TIMEOUT_MS = 15000  # 页面导航超时（毫秒）
+_FETCH_TIMEOUT_MS = 15000  # 单次浏览器请求超时（毫秒）；写请求超时后由上层按未知结果处理且不重试
+_SAFE_DOMCONTENTLOADED_GRACE_MS = 5000  # 技术优先模式：commit 后尽力等待 DOM，不作为硬门禁
 # zhipin 首页常驻请求多、headless 下基本进不了 networkidle；domcontentloaded 后 JS
 # 环境即可发 fetch，故宽限缩到 0.8s（实测每次都会耗满，缩短直接省 ~2s/搜索）。
 _HEADLESS_NETWORKIDLE_GRACE_MS = 800
@@ -81,9 +116,11 @@ _CHROME_USER_DATA_CANDIDATES = [
 
 
 class BrowserSession:
-	"""Persistent browser session that makes API calls via page.evaluate(fetch).
+	"""通过浏览器 context 发起 API 请求的持久会话。
 
-	Tries CDP connection to user's Chrome first; falls back to headless patchright.
+	默认优先连接用户 Chrome 的 CDP，失败后降级到 headless Patchright。
+	安全隔离 profile 使用 ``BrowserContext.request``，避免同步 ``page.evaluate``
+	卡住搜索或招呼；其他模式继续保留原通道。
 	"""
 
 	def __init__(
@@ -111,6 +148,23 @@ class BrowserSession:
 		self._logger = logger
 		self._bridge_client: Any = None
 		self._is_bridge = False
+		strict_cdp_url = os.environ.get(_SAFE_STRICT_CDP_ENV, "").strip()
+		self._strict_cdp = bool(strict_cdp_url)
+		if strict_cdp_url:
+			self._cdp_url = strict_cdp_url
+		self._isolated = os.environ.get("BOSS_SAFE_ISOLATED_BROWSER", "").strip().lower() in {
+			"1", "true", "yes", "on"
+		}
+		profile = os.environ.get("BOSS_SAFE_BROWSER_PROFILE", "").strip()
+		self._persistent_profile = Path(profile) if self._isolated and not self._strict_cdp and profile else None
+		self._is_persistent = False
+		self._commit_ready = False
+		self._readiness_stage = "init"
+
+	@property
+	def readiness_stage(self) -> str:
+		"""供隔离 worker 写入固定阶段诊断，不暴露 URL 或页面内容。"""
+		return self._readiness_stage
 
 	def _log(self, message: str) -> None:
 		"""Diagnostic channel logs: debug by default so TTY wizard stays clean."""
@@ -133,18 +187,86 @@ class BrowserSession:
 		if self._started:
 			return
 
-		# 优先尝试 Bridge 模式（Chrome 扩展 + daemon，零配置）
-		if self._try_bridge():
-			return
+		try:
+			self._pw = sync_playwright().start()
+			if self._strict_cdp:
+				if not self._cdp_url:
+					raise BrowserStageError("BROWSER_ERROR", "cdp_attach")
+				self._connect_strict_cdp(self._cdp_url)
+				return
 
-		self._pw = sync_playwright().start()
+			if not self._isolated:
+				# 优先尝试 Bridge 模式（Chrome 扩展 + daemon，零配置）
+				if self._try_bridge():
+					return
 
-		# 第二优先：CDP 连接用户 Chrome（登录态兼容）
-		if self._try_cdp():
-			return
+				# 第二优先：CDP 连接用户 Chrome（登录态兼容）
+				if self._try_cdp():
+					return
 
-		# 兜底：启动 headless patchright
-		self._start_headless()
+			# 兜底：启动 headless patchright
+			self._start_headless()
+		except Exception:
+			# sync_playwright() 使用线程局部状态；冷启动异常若不 stop，
+			# 下一次请求会误判为“在 asyncio loop 中重复使用 Sync API”。
+			self.close()
+			raise
+
+	def _connect_strict_cdp(self, url: str) -> None:
+		"""只附着登记的系统 Edge；不创建 context，也不降级其他通道。"""
+		try:
+			self._browser = self._pw.chromium.connect_over_cdp(url, timeout=_NAV_TIMEOUT_MS)
+		except Exception as exc:
+			raise BrowserStageError("BROWSER_ERROR", "cdp_attach") from exc
+		# 一旦连接成功就标记为 CDP，后续异常清理只能断开客户端，不能关闭 Edge。
+		self._is_cdp = True
+		contexts = self._browser.contexts
+		if not contexts:
+			raise BrowserStageError("BROWSER_ERROR", "cdp_attach")
+		self._context = contexts[0]
+		self._own_context = False
+
+		challenge_code: str | None = None
+		for page in reversed(list(getattr(self._context, "pages", None) or [])):
+			page_url = getattr(page, "url", "")
+			if not isinstance(page_url, str) or not _is_zhipin_url(page_url):
+				continue
+			challenge_code = _page_challenge_code(page_url) or challenge_code
+			if _page_challenge_code(page_url):
+				continue
+			try:
+				page.wait_for_load_state("domcontentloaded", timeout=_SAFE_DOMCONTENTLOADED_GRACE_MS)
+			except Exception:
+				continue
+			page_url = getattr(page, "url", "")
+			if not isinstance(page_url, str) or not _is_zhipin_url(page_url):
+				continue
+			challenge_code = _page_challenge_code(page_url) or challenge_code
+			if _page_challenge_code(page_url):
+				continue
+			self._page = page
+			self._own_page = False
+			self._readiness_stage = "page_ready"
+			break
+
+		if self._page is None:
+			if challenge_code is not None:
+				raise BrowserStageError(challenge_code, "page_ready")
+			self._page = self._context.new_page()
+			self._own_page = True
+			try:
+				self._page.goto(HOME_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+			except Exception as exc:
+				raise BrowserPageNotReady("page_ready") from exc
+			page_url = getattr(self._page, "url", "")
+			if not isinstance(page_url, str) or not _is_zhipin_url(page_url):
+				raise BrowserPageNotReady("page_ready")
+			if code := _page_challenge_code(page_url):
+				raise BrowserStageError(code, "page_ready")
+			self._readiness_stage = "page_ready"
+
+		self._started = True
+		self._log("[boss] 已连接专用 Edge 严格 CDP；未启用 Bridge、APIRequestContext 或无头回退")
 
 	def _try_bridge(self) -> bool:
 		"""尝试通过 Browser Bridge（Chrome 扩展 + daemon）连接。"""
@@ -288,42 +410,192 @@ class BrowserSession:
 		return None
 
 	def _start_headless(self) -> None:
-		"""Fallback: launch headless patchright Chromium."""
-		self._browser = self._pw.chromium.launch(headless=True)
-		self._context = self._browser.new_context(
-			user_agent=self._user_agent,
-			viewport={"width": 1280, "height": 800},
-			locale="zh-CN",
-			timezone_id="Asia/Shanghai",
-		)
+		"""启动 Patchright；安全入口复用扫码 profile 并保持可见模式。"""
+		context_options = {
+			"user_agent": self._user_agent,
+			"viewport": {"width": 1280, "height": 800},
+			"locale": "zh-CN",
+			"timezone_id": "Asia/Shanghai",
+		}
+		try:
+			if self._persistent_profile is not None:
+				self._persistent_profile.mkdir(parents=True, exist_ok=True)
+				self._context = self._pw.chromium.launch_persistent_context(
+					str(self._persistent_profile),
+					headless=False,
+					**context_options,
+				)
+				self._browser = self._context.browser
+				self._is_persistent = True
+			else:
+				self._browser = self._pw.chromium.launch(headless=True)
+				self._context = self._browser.new_context(**context_options)
+		except Exception as exc:
+			raise BrowserStageError("BROWSER_ERROR", "context_launch") from exc
 		self._own_context = True
-		self._own_page = True
 		self._context.add_cookies(
 			[
 				{"name": name, "value": value, "domain": ".zhipin.com", "path": "/"}
 				for name, value in self._cookies.items()
 			]
 		)
-		self._page = self._context.new_page()
-		self._page.goto(HOME_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
-		try:
-			self._page.wait_for_load_state("networkidle", timeout=_HEADLESS_NETWORKIDLE_GRACE_MS)
-		except Exception as e:
-			# zhipin 首页常驻请求较多，headless 模式下不一定能进入 networkidle；
-			# 页面 JS 环境已可用时，继续直接发起 fetch 请求更稳。
-			self._log(f"[boss] headless 首页未进入 networkidle（{e}），继续直接发起请求")
+		# 安全持久化 context 可能恢复上一次遗留、仍在导航的页面。它只承载
+		# 登录 profile，不作为本命令请求页；本次 worker 始终创建一个新页。
+		reused = None if self._is_persistent else _find_reusable_zhipin_page(self._context)
+		if reused is not None:
+			self._page = reused
+			self._own_page = False
+			self._ensure_page_ready(stage="reused_page_ready")
+			self._readiness_stage = "reused_page_ready"
+		else:
+			self._page = self._context.new_page()
+			self._own_page = True
+			if self._is_persistent:
+				try:
+					self._page.goto(HOME_URL, wait_until="commit", timeout=_NAV_TIMEOUT_MS)
+				except Exception as exc:
+					raise BrowserPageNotReady("navigate_commit") from exc
+				url = getattr(self._page, "url", "")
+				if isinstance(url, str) and not _is_zhipin_url(url):
+					raise BrowserPageNotReady("navigate_commit")
+				self._commit_ready = True
+				try:
+					self._page.wait_for_load_state(
+						"domcontentloaded",
+						timeout=_SAFE_DOMCONTENTLOADED_GRACE_MS,
+					)
+					self._readiness_stage = "navigate_domcontentloaded"
+				except Exception:
+					# 独立 worker 和单次调用硬超时负责回收同步请求；这里只将
+					# DOM 超时降级为 commit-ready，不自动导航或重试。
+					self._readiness_stage = "navigate_commit_only"
+			else:
+				try:
+					self._page.goto(HOME_URL, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+				except Exception as exc:
+					raise BrowserPageNotReady("navigate_domcontentloaded") from exc
+				self._ensure_page_ready(stage="navigate_domcontentloaded")
+				self._readiness_stage = "navigate_domcontentloaded"
+		if self._readiness_stage != "navigate_commit_only":
+			try:
+				self._page.wait_for_load_state("networkidle", timeout=_HEADLESS_NETWORKIDLE_GRACE_MS)
+			except Exception as e:
+				# zhipin 首页常驻请求较多，不一定能进入 networkidle。
+				self._log(f"[boss] headless 首页未进入 networkidle（{e}），继续直接发起请求")
 		self._started = True
 		self._is_cdp = False
-		self._log(
-			"[boss] CDP 不可用（提示：需以 --remote-debugging-port=9222 启动 Chrome），降级到 headless patchright"
-		)
+		if self._is_persistent:
+			self._log("[boss] 安全入口复用独立持久化 Patchright profile（可见模式）")
+		else:
+			self._log(
+				"[boss] CDP 不可用（提示：需以 --remote-debugging-port=9222 启动 Chrome），降级到 headless patchright"
+			)
+
+	def _ensure_page_ready(self, *, stage: str = "request_page_ready") -> None:
+		"""确认页面同源且不在人工安全检查页，失败时绝不 evaluate。"""
+		page = self._page
+		if page is None:
+			raise BrowserPageNotReady(stage)
+		url = getattr(page, "url", "")
+		# 真实 Patchright page.url 始终是字符串；对测试替身保留兼容性。
+		if isinstance(url, str) and not _is_zhipin_url(url):
+			raise BrowserPageNotReady(stage)
+		if self._strict_cdp:
+			if not isinstance(url, str):
+				raise BrowserPageNotReady(stage)
+			if code := _page_challenge_code(url):
+				raise BrowserStageError(code, "page_ready")
+		if self._is_persistent and self._commit_ready:
+			return
+		try:
+			timeout = _SAFE_DOMCONTENTLOADED_GRACE_MS if self._strict_cdp else _NAV_TIMEOUT_MS
+			page.wait_for_load_state("domcontentloaded", timeout=timeout)
+		except Exception as exc:
+			raise BrowserPageNotReady(stage) from exc
+		if self._strict_cdp:
+			url = getattr(page, "url", "")
+			if not isinstance(url, str) or not _is_zhipin_url(url):
+				raise BrowserPageNotReady(stage)
+			if code := _page_challenge_code(url):
+				raise BrowserStageError(code, "page_ready")
 
 	# ── Core request via browser fetch() ─────────────────────────────
+
+	@staticmethod
+	def _stringify_request_value(value: Any) -> str:
+		"""对 BOSS 表单值复现 JavaScript ``String(value)`` 的转换结果。"""
+		if value is None:
+			return "null"
+		if value is True:
+			return "true"
+		if value is False:
+			return "false"
+		return str(value)
+
+	def _request_via_context(
+		self,
+		method: str,
+		url: str,
+		*,
+		params: dict[str, Any] | None,
+		data: dict[str, Any] | None,
+		referer: str,
+	) -> dict[str, Any]:
+		"""仅调用一次持久化 context 中共享 Cookie 的请求 API。"""
+		response: Any = None
+		try:
+			request_context = self._context.request
+			headers = {
+				"Accept": "application/json, text/plain, */*",
+				"Referer": referer,
+				"X-Requested-With": "XMLHttpRequest",
+			}
+			request_params = {
+				str(key): self._stringify_request_value(value)
+				for key, value in (params or {}).items()
+				if value is not None
+			}
+			request_form = None
+			if method.upper() == "POST" and data is not None:
+				headers["Content-Type"] = "application/x-www-form-urlencoded"
+				request_form = {
+					str(key): self._stringify_request_value(value)
+					for key, value in data.items()
+				}
+			response = request_context.fetch(
+				url,
+				method=method.upper(),
+				params=request_params or None,
+				headers=headers,
+				form=request_form,
+				timeout=_FETCH_TIMEOUT_MS,
+				fail_on_status_code=False,
+				max_retries=0,
+			)
+			result = response.json()
+			if not isinstance(result, dict):
+				raise BrowserStageError("BROWSER_ERROR", "context_request")
+			return cast("dict[str, Any]", result)
+		except PatchrightTimeoutError as exc:
+			raise BrowserStageError("BROWSER_HUNG", "context_request") from exc
+		except BrowserStageError:
+			raise
+		except Exception as exc:
+			raise BrowserStageError("BROWSER_ERROR", "context_request") from exc
+		finally:
+			if response is not None:
+				try:
+					response.dispose()
+				except Exception:
+					# 响应释放异常不得遮蔽原始稳定结果或错误。
+					pass
 
 	def request(
 		self, method: str, url: str, *, params: dict[str, Any] | None = None, data: dict[str, Any] | None = None
 	) -> dict[str, Any]:
 		self._ensure_started()
+		# 安全持久化页允许 commit-ready；其同步调用由独立 worker 硬超时回收。
+		self._ensure_page_ready(stage="request_page_ready")
 		self._throttle.wait()
 
 		referer = endpoints.REFERER_MAP.get(url, f"{endpoints.BASE_URL}/")
@@ -344,10 +616,26 @@ class BrowserSession:
 			self._throttle.mark()
 			return cast("dict[str, Any]", result)
 
-		# Playwright 模式（CDP 或 headless）
-		result = self._page.evaluate(
-			"""
-			async ({method, url, params, data, referer}) => {
+		# 安全持久化 context 与 APIRequestContext 共享 Cookie；失败后不得回退，
+		# 因为 POST 可能已经到达服务端。
+		if self._is_persistent:
+			result = self._request_via_context(
+				method,
+				url,
+				params=params,
+				data=data,
+				referer=referer,
+			)
+			self._throttle.mark()
+			return result
+
+		# Playwright 页面上下文模式（严格 CDP 或普通 CLI 的既有通道）。
+		try:
+			result = self._page.evaluate(
+				"""
+			async ({method, url, params, data, referer, requestTimeoutMs}) => {
+				const controller = new AbortController();
+				const timeoutHandle = setTimeout(() => controller.abort(), requestTimeoutMs);
 				try {
 					let fetchUrl = url;
 					if (params && Object.keys(params).length > 0) {
@@ -366,6 +654,7 @@ class BrowserSession:
 							'Referer': referer,
 							'X-Requested-With': 'XMLHttpRequest',
 						},
+						signal: controller.signal,
 					};
 
 					if (method === 'POST' && data) {
@@ -380,12 +669,40 @@ class BrowserSession:
 					const resp = await fetch(fetchUrl, options);
 					return await resp.json();
 				} catch (e) {
-					return {code: -1, message: e.message, zpData: {}};
+					const message = e && e.name === 'AbortError'
+						? `BROWSER_FETCH_TIMEOUT_${requestTimeoutMs}MS`
+						: String((e && e.message) || e || 'BROWSER_FETCH_ERROR');
+					return {code: -1, message, zpData: {}};
+				} finally {
+					clearTimeout(timeoutHandle);
 				}
 			}
-		""",
-			{"method": method, "url": url, "params": params or {}, "data": data, "referer": referer},
-		)
+			""",
+				{
+					"method": method,
+					"url": url,
+					"params": params or {},
+					"data": data,
+					"referer": referer,
+					"requestTimeoutMs": _FETCH_TIMEOUT_MS,
+				},
+			)
+		except PatchrightTimeoutError as exc:
+			if self._strict_cdp:
+				raise BrowserStageError("BROWSER_HUNG", "page_fetch") from exc
+			raise
+		except Exception as exc:
+			if self._strict_cdp:
+				raise BrowserStageError("BROWSER_ERROR", "page_fetch") from exc
+			raise
+		if self._strict_cdp:
+			if not isinstance(result, dict):
+				raise BrowserStageError("BROWSER_ERROR", "page_fetch")
+			message = str(result.get("message") or "")
+			if result.get("code") == -1:
+				if message.startswith("BROWSER_FETCH_TIMEOUT_"):
+					raise BrowserStageError("BROWSER_HUNG", "page_fetch")
+				raise BrowserStageError("BROWSER_ERROR", "page_fetch")
 
 		self._throttle.mark()
 		return cast("dict[str, Any]", result)
@@ -452,7 +769,13 @@ class BrowserSession:
 			self._started = False
 			return
 
-		if self._is_cdp:
+		if self._is_persistent:
+			if self._context:
+				try:
+					self._context.close()
+				except Exception:
+					pass
+		elif self._is_cdp:
 			# CDP 模式：只关闭我们新建的 page 和 context，不动用户浏览器或已复用的页签
 			if self._page and self._own_page:
 				try:
@@ -477,6 +800,7 @@ class BrowserSession:
 			except Exception:
 				pass
 		self._started = False
+		self._is_persistent = False
 
 	def __enter__(self) -> "BrowserSession":
 		return self

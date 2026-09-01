@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Any
 
@@ -166,8 +167,11 @@ class AuthManager:
 					self._token = refreshed
 					return
 
-				# CDP 优先：指纹一致，不会被 BOSS 直聘拒绝
-				if probe_cdp(cdp_url):
+				# 安全投递进程显式使用独立 Patchright，不读取或连接用户浏览器。
+				isolated = os.environ.get("BOSS_SAFE_ISOLATED_BROWSER", "").strip().lower() in {
+					"1", "true", "yes", "on"
+				}
+				if not isolated and probe_cdp(cdp_url):
 					self._logger.info("检测到 CDP，使用 CDP 刷新 stoken")
 					new_stoken = refresh_stoken_via_cdp(cdp_url)
 				else:

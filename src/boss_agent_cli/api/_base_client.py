@@ -13,6 +13,7 @@ dialect (HTTP + body 401/403/429, no stoken, CSRF bootstrap).
 
 from __future__ import annotations
 
+import os
 import random
 import time
 from types import TracebackType
@@ -141,6 +142,12 @@ class _BaseHttpClient:
 
 			# stoken 过期 → 刷新重试
 			if code == self._CODE_STOKEN_EXPIRED and attempt < _MAX_RETRIES:
+				# 安全入口对 code 37 不自动刷新、不重试、不切换通道；
+				# 交给上层按响应消息区分环境风险或明确 Token 过期。
+				if os.environ.get("BOSS_SAFE_ISOLATED_BROWSER", "").strip().lower() in {
+					"1", "true", "yes", "on"
+				}:
+					return cast("dict[str, Any]", data)
 				backoff = (2**attempt) + random.uniform(0.5, 1.5)
 				time.sleep(backoff)
 				self._auth.force_refresh(cdp_url=self._cdp_url)

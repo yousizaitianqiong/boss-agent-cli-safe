@@ -49,7 +49,15 @@ class BossClient(_BaseHttpClient):
 			msg = result.get("message", "账户存在异常行为")
 			browser = self._get_browser()
 			is_cdp = getattr(browser, "_is_cdp", False)
-			mode = "CDP" if is_cdp else ("Bridge" if getattr(browser, "_is_bridge", False) else "headless patchright")
+			mode = (
+				"CDP"
+				if is_cdp
+				else (
+					"Bridge"
+					if getattr(browser, "_is_bridge", False)
+					else ("safe persistent patchright" if getattr(browser, "_is_persistent", False) else "headless patchright")
+				)
+			)
 			raise AccountRiskError(
 				f"BOSS 直聘风控拦截 (code {code}): {msg}。"
 				f"当前浏览器模式: {mode}。"

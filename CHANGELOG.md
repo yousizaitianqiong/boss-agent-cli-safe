@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [v1.18.0-safe.1] - 2026-09-01
+
+### Added
+- 新增 `boss-safe init` 与 `schema_version=1` 配置：申请人必须填写真实专业、城市、到岗信息、实习时长、技术方向、技能表述和简历证据；旧配置采用备份加原子迁移。
+- 新增 Windows、macOS、Linux 通用的可见专用浏览器运行时，按 Edge、Chrome、Chromium 自动发现，并使用 `psutil` 校验 PID 创建时间、进程树、命令行 profile 和 loopback CDP 端口归属。
+- 新增只读探针、一次性预览授权、批次专属交互确认、北京时间每日 150 次写请求硬额度、永久岗位去重、超时记 `unknown` 和失败关闭清理。
+- 新增三系统 Python 3.12 安全矩阵、wheel 干净安装冒烟、发行隐私扫描和 `SHA256SUMS.txt`。
+
+### Changed
+- 发行包名称改为 `boss-agent-cli-safe==1.18.0.post1`，保留 `boss`、`boss-mcp`、`boss-safe` 三个入口。
+- Release 仅发布到 GitHub，不再执行 PyPI 上传；公开文档改为通用路径并保留上游来源、历史和 MIT 许可证说明。
+
 ## [1.18.0] - 2026-07-29
 
 ### Added
